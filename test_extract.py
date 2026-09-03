@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -21,6 +22,12 @@ import extract
 
 
 class ExtractTest(unittest.TestCase):
+    def test_interpretar_fecha_acepta_iso_y_unix(self):
+        self.assertEqual(extract.interpretar_fecha("2026-09-03T10:30:00Z"), date(2026, 9, 3))
+        marca = str(datetime(2026, 9, 3, 12).timestamp())
+        self.assertEqual(extract.interpretar_fecha(marca), date(2026, 9, 3))
+        self.assertIsNone(extract.interpretar_fecha("sin fecha"))
+
     def test_formatear_chat_incluye_encabezado_y_mensajes(self):
         resultado = extract.formatear_chat("Ana", ["Hola", "¿Cómo estás?"])
 
@@ -68,6 +75,21 @@ class AbrirBandejaTest(unittest.IsolatedAsyncioTestCase):
                 raise extract.PlaywrightTimeoutError("lento")
 
         await extract.abrir_bandeja(Pagina())
+
+    async def test_login_sigue_esperando_despues_del_primer_timeout(self):
+        class Pagina:
+            def __init__(self):
+                self.timeouts = []
+
+            async def wait_for_selector(self, *_args, **opciones):
+                self.timeouts.append(opciones["timeout"])
+                if len(self.timeouts) == 1:
+                    raise extract.PlaywrightTimeoutError("login lento")
+
+        pagina = Pagina()
+        await extract.esperar_inicio_sesion(pagina)
+
+        self.assertEqual(pagina.timeouts, [120_000, 0])
 
 
 if __name__ == "__main__":

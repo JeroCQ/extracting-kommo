@@ -2,6 +2,8 @@
 """Exporta conversaciones desde la bandeja de entrada web de Kommo."""
 
 import asyncio
+import argparse
+from datetime import date, datetime
 from pathlib import Path
 
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
@@ -23,6 +25,20 @@ SELECTORES_NOMBRE = (
 )
 ITERACIONES_SCROLL = 15
 PAUSA_SCROLL_MS = 1_500
+
+
+def argumentos() -> argparse.Namespace:
+    """Lee la fecha inicial; por defecto usa el 1 de septiembre del año actual."""
+    predeterminada = date.today().replace(month=9, day=1).isoformat()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--desde",
+        type=date.fromisoformat,
+        default=date.fromisoformat(predeterminada),
+        metavar="AAAA-MM-DD",
+        help=f"fecha inicial inclusiva (predeterminado: {predeterminada})",
+    )
+    return parser.parse_args()
 
 
 async def primer_visible(page: Page, selector: str) -> Locator:
@@ -57,20 +73,63 @@ async def cargar_historial(historial: Locator) -> None:
         await historial.page.wait_for_timeout(PAUSA_SCROLL_MS)
 
 
-async def extraer_mensajes(page: Page, historial: Locator) -> list[str]:
-    """Extrae el texto visible de los nodos de mensajes del chat activo."""
+def interpretar_fecha(valor: str | None) -> date | None:
+    """Convierte fechas ISO o timestamps Unix encontrados en el DOM de Kommo."""
+    if not valor:
+        return None
+    valor = valor.strip()
+    try:
+        numero = float(valor)
+        if numero > 10_000_000_000:
+            numero /= 1_000
+        return datetime.fromtimestamp(numero).date()
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(valor.replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return date.fromisoformat(valor[:10])
+        except ValueError:
+            return None
+
+
+async def fecha_mensaje(mensaje: Locator) -> date | None:
+    """Busca la fecha en los atributos habituales del mensaje o de su ``time``."""
+    for atributo in ("data-created-at", "data-timestamp", "data-time", "datetime"):
+        encontrada = interpretar_fecha(await mensaje.get_attribute(atributo))
+        if encontrada:
+            return encontrada
+
+    tiempos = mensaje.locator("time[datetime]")
+    if await tiempos.count():
+        return interpretar_fecha(await tiempos.first.get_attribute("datetime"))
+    return None
+
+
+async def extraer_mensajes(
+    page: Page, historial: Locator, desde: date
+) -> tuple[list[str], int]:
+    """Extrae solo mensajes fechados desde el límite inclusivo indicado."""
     mensajes = historial.locator(SELECTOR_MENSAJE)
     if await mensajes.count() == 0:
         mensajes = page.locator(SELECTOR_MENSAJE)
 
     textos = []
+    sin_fecha = 0
     for indice in range(await mensajes.count()):
         mensaje = mensajes.nth(indice)
         if await mensaje.is_visible():
+            fecha = await fecha_mensaje(mensaje)
+            if fecha is None:
+                sin_fecha += 1
+                continue
+            if fecha < desde:
+                continue
             texto = (await mensaje.inner_text()).strip()
             if texto:
                 textos.append(texto)
-    return textos
+    return textos, sin_fecha
 
 
 def formatear_chat(nombre: str, mensajes: list[str]) -> str:
@@ -86,22 +145,28 @@ def guardar_chat(nombre: str, mensajes: list[str]) -> None:
         archivo.write(formatear_chat(nombre, mensajes))
 
 
-async def exportar(page: Page) -> None:
-    """Recorre ordenadamente las conversaciones actualmente cargadas."""
+async def esperar_inicio_sesion(page: Page) -> None:
+    """Espera la bandeja sin cerrar el navegador si el login toma más de 120 s."""
     try:
         await page.wait_for_selector(SELECTOR_LISTA, state="visible", timeout=120_000)
-    except PlaywrightTimeoutError as error:
-        raise RuntimeError(
-            "No apareció la lista de chats en 120 segundos. "
-            "Inicia sesión en Kommo y vuelve a ejecutar el script."
-        ) from error
+    except PlaywrightTimeoutError:
+        print(
+            "Aún no aparece la bandeja. La ventana seguirá abierta: "
+            "termina de iniciar sesión; esperaré sin límite de tiempo..."
+        )
+        await page.wait_for_selector(SELECTOR_LISTA, state="visible", timeout=0)
+
+
+async def exportar(page: Page, desde: date) -> None:
+    """Recorre ordenadamente las conversaciones actualmente cargadas."""
+    await esperar_inicio_sesion(page)
 
     cantidad = await page.locator(SELECTOR_CHAT).count()
     if cantidad == 0:
         raise RuntimeError("La bandeja está visible, pero no contiene chats abiertos.")
 
     ARCHIVO_SALIDA.write_text("", encoding="utf-8")
-    print(f"Se encontraron {cantidad} chats. Iniciando exportación...")
+    print(f"Se encontraron {cantidad} chats. Exportando mensajes desde {desde}...")
 
     for indice in range(cantidad):
         try:
@@ -114,9 +179,15 @@ async def exportar(page: Page) -> None:
             historial = await primer_visible(page, SELECTOR_HISTORIAL)
             nombre = await nombre_chat(page, chat, indice)
             await cargar_historial(historial)
-            mensajes = await extraer_mensajes(page, historial)
-            guardar_chat(nombre, mensajes)
-            print(f"[{indice + 1}/{cantidad}] Guardado: {nombre} ({len(mensajes)} mensajes)")
+            mensajes, sin_fecha = await extraer_mensajes(page, historial, desde)
+            if mensajes:
+                guardar_chat(nombre, mensajes)
+                estado = f"Guardado: {nombre} ({len(mensajes)} mensajes)"
+            else:
+                estado = f"Omitido: {nombre} (sin mensajes fechados desde {desde})"
+            if sin_fecha:
+                estado += f"; {sin_fecha} nodos sin fecha se omitieron"
+            print(f"[{indice + 1}/{cantidad}] {estado}")
         except Exception as error:  # un chat defectuoso no detiene los demás
             print(f"[{indice + 1}/{cantidad}] Error al procesar el chat: {error}")
 
@@ -134,7 +205,7 @@ async def abrir_bandeja(page: Page) -> None:
         )
 
 
-async def main() -> None:
+async def main(desde: date) -> None:
     """Abre una sesión persistente de Chromium y ejecuta la exportación."""
     DIRECTORIO_SESION.mkdir(parents=True, exist_ok=True)
     async with async_playwright() as playwright:
@@ -147,11 +218,11 @@ async def main() -> None:
             pagina = contexto.pages[0] if contexto.pages else await contexto.new_page()
             await abrir_bandeja(pagina)
             print("Esperando la bandeja. Si es la primera ejecución, inicia sesión manualmente.")
-            await exportar(pagina)
+            await exportar(pagina, desde)
             print(f"Exportación terminada: {ARCHIVO_SALIDA.resolve()}")
         finally:
             await contexto.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(argumentos().desde))

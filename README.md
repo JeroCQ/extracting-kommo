@@ -21,12 +21,22 @@ El archivo ya tiene permiso de ejecución, por lo que puede iniciarse con:
 ./extract.py
 ```
 
-También se puede ejecutar mediante `python extract.py`.
+También se puede ejecutar mediante `python extract.py`. Para exportar desde el
+1 de septiembre de 2026 hasta hoy, usa:
+
+```bash
+python extract.py --desde 2026-09-01
+```
+
+`--desde` es inclusivo: conserva los mensajes del día indicado y posteriores.
+Si no indicas la opción, se usa el 1 de septiembre del año actual.
 
 El navegador usa `./kommo_session` como perfil persistente. En la primera
 ejecución, inicia sesión manualmente cuando aparezca la ventana. El script
-espera hasta 120 segundos a que la lista de chats sea visible; en ejecuciones
-posteriores Kommo normalmente reutilizará la sesión guardada.
+espera inicialmente 120 segundos a que la lista de chats sea visible. Si el
+inicio de sesión tarda más, muestra un aviso y sigue esperando sin límite; la
+ventana no se cierra. En ejecuciones posteriores Kommo normalmente reutilizará
+la sesión guardada.
 
 Kommo puede continuar cargando recursos en segundo plano durante varios
 minutos. El script inicia la navegación sin esperar toda esa actividad y usa
@@ -37,7 +47,7 @@ Para cada chat, el script:
 
 1. abre la conversación;
 2. desplaza el historial al inicio 15 veces, esperando 1,5 segundos cada vez;
-3. obtiene el texto visible de los mensajes; y
+3. conserva los mensajes cuya fecha sea igual o posterior a `--desde`; y
 4. lo añade inmediatamente a `conversaciones_kommo.txt` en UTF-8.
 
 La escritura progresiva conserva los chats ya procesados si uno posterior
@@ -46,11 +56,14 @@ continúa con la siguiente conversación.
 
 ### Si la navegación es lenta
 
-Si aparece `La navegación está tardando más de lo esperado`, no cierres la
-ventana: termina el inicio de sesión y espera. El script seguirá buscando la
-lista de chats durante 120 segundos adicionales. Si finalmente indica que no
-apareció la lista, comprueba la conexión, abre Kommo manualmente y vuelve a
-ejecutar `python extract.py`.
+Si aparece `La navegación está tardando más de lo esperado` o `Aún no aparece
+la bandeja`, no cierres la ventana: termina el inicio de sesión y espera. Tras
+los primeros 120 segundos, el script mantiene la ventana abierta y espera la
+lista de chats sin límite de tiempo.
+
+Los nodos para los que Kommo no exponga una fecha se omiten para evitar incluir
+mensajes anteriores al período solicitado, y el total omitido se informa en la
+terminal.
 
 > **Importante:** la automatización depende de la estructura DOM de Kommo. Si
 > Kommo cambia sus clases CSS, actualiza los selectores declarados al inicio de
