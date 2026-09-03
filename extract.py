@@ -121,6 +121,19 @@ async def exportar(page: Page) -> None:
             print(f"[{indice + 1}/{cantidad}] Error al procesar el chat: {error}")
 
 
+async def abrir_bandeja(page: Page) -> None:
+    """Navega sin esperar a que toda la aplicación termine de cargar."""
+    try:
+        await page.goto(URL_KOMMO, wait_until="commit", timeout=120_000)
+    except PlaywrightTimeoutError:
+        # La lista de chats será la comprobación definitiva en ``exportar``.
+        # Continuar permite que el usuario termine un inicio de sesión lento.
+        print(
+            "La navegación está tardando más de lo esperado; "
+            "continuaré esperando la bandeja de Kommo..."
+        )
+
+
 async def main() -> None:
     """Abre una sesión persistente de Chromium y ejecuta la exportación."""
     DIRECTORIO_SESION.mkdir(parents=True, exist_ok=True)
@@ -132,7 +145,7 @@ async def main() -> None:
         )
         try:
             pagina = contexto.pages[0] if contexto.pages else await contexto.new_page()
-            await pagina.goto(URL_KOMMO, wait_until="domcontentloaded")
+            await abrir_bandeja(pagina)
             print("Esperando la bandeja. Si es la primera ejecución, inicia sesión manualmente.")
             await exportar(pagina)
             print(f"Exportación terminada: {ARCHIVO_SALIDA.resolve()}")

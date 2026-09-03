@@ -49,5 +49,26 @@ class ExtractTest(unittest.TestCase):
         self.assertLess(contenido.index("CHAT: Ana"), contenido.index("CHAT: Luis"))
 
 
+class AbrirBandejaTest(unittest.IsolatedAsyncioTestCase):
+    async def test_navega_sin_esperar_domcontentloaded(self):
+        class Pagina:
+            async def goto(self, url, **opciones):
+                self.llamada = (url, opciones)
+
+        pagina = Pagina()
+        await extract.abrir_bandeja(pagina)
+
+        self.assertEqual(pagina.llamada[0], extract.URL_KOMMO)
+        self.assertEqual(pagina.llamada[1]["wait_until"], "commit")
+        self.assertEqual(pagina.llamada[1]["timeout"], 120_000)
+
+    async def test_timeout_no_impide_verificar_la_lista_despues(self):
+        class Pagina:
+            async def goto(self, *_args, **_opciones):
+                raise extract.PlaywrightTimeoutError("lento")
+
+        await extract.abrir_bandeja(Pagina())
+
+
 if __name__ == "__main__":
     unittest.main()
