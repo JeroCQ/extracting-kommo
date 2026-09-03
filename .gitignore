@@ -1,0 +1,4 @@
+kommo_session/
+conversaciones_kommo.txt
+__pycache__/
+*.py[cod]
