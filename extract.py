@@ -15,6 +15,15 @@ DIAS = 7
 LIMITE = 250
 
 
+class AccesoTalksDenegado(Exception):
+    """El token es válido para Events, pero no está autorizado para Talks."""
+
+    def __init__(self, talk_id, detalle=""):
+        self.talk_id = talk_id
+        self.detalle = detalle
+        super().__init__(f"Acceso denegado al talk {talk_id}")
+
+
 def obtener_token():
     """Obtiene el token de Colab o, fuera de Colab, de una variable de entorno."""
     token = os.getenv("KOMMO_KEY")
@@ -92,6 +101,10 @@ def obtener_historial(session, base_url, talk_id):
         )
         if respuesta.status_code == 204:
             break
+        if respuesta.status_code == 403:
+            # Un 403 aquí no se arregla reintentando los demás talks: Events y
+            # Talks tienen permisos distintos en Kommo.
+            raise AccesoTalksDenegado(talk_id, respuesta.text[:500])
         respuesta.raise_for_status()
         lote = respuesta.json().get("_embedded", {}).get("messages", [])
         mensajes.extend(lote)
@@ -116,6 +129,20 @@ def texto_mensaje(mensaje):
     return ""
 
 
+def texto_en_evento(evento):
+    """Compatibilidad con conectores que sí incluyen el cuerpo en el evento."""
+    value_after = evento.get("value_after") or []
+    if isinstance(value_after, dict):
+        value_after = [value_after]
+    for cambio in value_after:
+        if not isinstance(cambio, dict):
+            continue
+        texto = texto_mensaje(cambio.get("message", {}))
+        if texto:
+            return texto
+    return ""
+
+
 def exportar_conversaciones(session, base_url, desde):
     """Cruza eventos con historiales y agrupa los mensajes por lead/talk."""
     eventos = obtener_eventos(session, base_url, desde)
@@ -125,30 +152,53 @@ def exportar_conversaciones(session, base_url, desde):
         if talk_id and message_id:
             referencias[message_id] = (talk_id, evento)
 
+    # Algunos conectores incluyen texto y otros (como WABA) solo dejan el
+    # puntero. Conservamos lo primero y consultamos Talks solo si hace falta.
+    textos = {
+        message_id: texto_en_evento(evento)
+        for message_id, (_, evento) in referencias.items()
+    }
+    ids_pendientes = {message_id for message_id, texto in textos.items() if not texto}
+
     historiales = {}
     errores = []
-    for talk_id in sorted({referencia[0] for referencia in referencias.values()}):
+    talks_pendientes = {
+        talk_id
+        for message_id, (talk_id, _) in referencias.items()
+        if message_id in ids_pendientes
+    }
+    for talk_id in sorted(talks_pendientes):
         try:
             historiales[talk_id] = obtener_historial(session, base_url, talk_id)
+        except AccesoTalksDenegado:
+            # La autorización es de la integración, no de una conversación
+            # concreta. Fallar pronto evita cientos de avisos idénticos.
+            raise
         except requests.HTTPError as error:
             estado = error.response.status_code if error.response is not None else "?"
             errores.append(f"talk {talk_id}: HTTP {estado}")
 
     grupos = {}
     for message_id, (talk_id, evento) in referencias.items():
-        mensaje = next(
-            (item for item in historiales.get(talk_id, []) if str(item.get("id")) == message_id),
-            None,
-        )
-        if not mensaje:
-            continue
-        texto = texto_mensaje(mensaje)
+        texto = textos[message_id]
+        mensaje = None
+        if not texto:
+            mensaje = next(
+                (
+                    item
+                    for item in historiales.get(talk_id, [])
+                    if str(item.get("id")) == message_id
+                ),
+                None,
+            )
+            texto = texto_mensaje(mensaje) if mensaje else ""
         if not texto:
             continue
         direccion = "Cliente" if evento.get("type") == "incoming_chat_message" else "Asesor"
         clave = (evento.get("entity_type", "lead").upper(), evento.get("entity_id"), talk_id)
+        creado = evento.get("created_at") or (mensaje or {}).get("created_at", 0)
         grupos.setdefault(clave, []).append(
-            (evento.get("created_at", mensaje.get("created_at", 0)), direccion, texto)
+            (creado, direccion, texto)
         )
 
     return eventos, grupos, errores
@@ -181,6 +231,20 @@ def main():
     print(f"Buscando eventos y conversaciones de los últimos {DIAS} días...")
     try:
         eventos, grupos, errores = exportar_conversaciones(session, base_url, desde)
+    except AccesoTalksDenegado as error:
+        print("\nKommo aceptó el token para Events, pero rechazó el acceso a Talks (HTTP 403).")
+        print(f"La comprobación falló con el talk {error.talk_id}.")
+        print(
+            "Activa el permiso de chats/conversaciones en la integración de Kommo, "
+            "vuelve a autorizarla y reemplaza KOMMO_KEY por el nuevo token."
+        )
+        print(
+            "Los eventos WABA solo contienen id y talk_id; sin ese permiso Kommo no "
+            "entrega el texto y el script no puede reconstruirlo."
+        )
+        if error.detalle:
+            print(f"Detalle de Kommo: {error.detalle}")
+        return
     except requests.HTTPError as error:
         detalle = error.response.text[:500] if error.response is not None else str(error)
         raise SystemExit(f"Kommo devolvió un error: {detalle}") from error
