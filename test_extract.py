@@ -57,6 +57,52 @@ class ExtractTest(unittest.TestCase):
 
 
 class AbrirBandejaTest(unittest.IsolatedAsyncioTestCase):
+    async def test_conserva_mensajes_cuando_kommo_no_expone_la_fecha(self):
+        class Vacio:
+            async def count(self):
+                return 0
+
+        class Mensaje:
+            async def is_visible(self):
+                return True
+
+            async def get_attribute(self, _atributo):
+                return None
+
+            def locator(self, _selector):
+                return Vacio()
+
+            async def inner_text(self):
+                return "Hola, quiero información"
+
+        class Mensajes:
+            async def count(self):
+                return 1
+
+            def nth(self, _indice):
+                return Mensaje()
+
+        class Pagina:
+            def locator(self, _selector):
+                return Mensajes()
+
+        textos, sin_fecha = await extract.extraer_mensajes(
+            Pagina(), None, date(2026, 9, 1)
+        )
+
+        self.assertEqual(textos, ["Hola, quiero información"])
+        self.assertEqual(sin_fecha, 1)
+
+    async def test_desplaza_el_contenedor_de_la_lista(self):
+        class Chat:
+            async def evaluate(self, javascript):
+                self.javascript = javascript
+                return True
+
+        chat = Chat()
+        self.assertTrue(await extract.desplazar_lista_chats(chat))
+        self.assertIn("scrollTop", chat.javascript)
+
     async def test_navega_sin_esperar_domcontentloaded(self):
         class Pagina:
             async def goto(self, url, **opciones):

@@ -48,11 +48,15 @@ Para cada chat, el script:
 1. abre la conversación;
 2. desplaza el historial al inicio 15 veces, esperando 1,5 segundos cada vez;
 3. conserva los mensajes cuya fecha sea igual o posterior a `--desde`; y
-4. lo añade inmediatamente a `conversaciones_kommo.txt` en UTF-8.
+4. lo añade inmediatamente a `conversaciones_kommo.txt` en UTF-8; y
+5. desplaza la lista lateral para descubrir los siguientes chats, incluidos los
+   que Kommo todavía no había insertado en la página.
 
 La escritura progresiva conserva los chats ya procesados si uno posterior
 falla. Los errores individuales se muestran en la terminal y el recorrido
-continúa con la siguiente conversación.
+continúa con la siguiente conversación. Incluso un chat sin mensajes visibles
+deja un bloque `[Sin mensajes visibles]`, de modo que el archivo no queda vacío
+silenciosamente después de haber recorrido conversaciones.
 
 ### Si la navegación es lenta
 
@@ -67,9 +71,10 @@ error); mientras no reaparezca, sigue ejecutándose.
 Si alguien cierra el navegador, se muestra un mensaje directo indicando que se
 perdió la conexión, en lugar del error secundario `BrowserContext.close`.
 
-Los nodos para los que Kommo no exponga una fecha se omiten para evitar incluir
-mensajes anteriores al período solicitado, y el total omitido se informa en la
-terminal.
+Kommo no siempre expone la fecha como un atributo del mensaje. Para evitar la
+pérdida de conversaciones que produjo archivos vacíos, esos mensajes se
+conservan y la terminal informa cuántos no pudieron fecharse. El filtro
+`--desde` se aplica a todos los mensajes cuya fecha sí puede verificarse.
 
 > **Importante:** la automatización depende de la estructura DOM de Kommo. Si
 > Kommo cambia sus clases CSS, actualiza los selectores declarados al inicio de

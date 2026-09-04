@@ -6,6 +6,7 @@ import argparse
 import re
 from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -24,8 +25,16 @@ SELECTOR_CHAT = ", ".join(
         '[data-entity="chat"]',
     )
 )
-SELECTOR_HISTORIAL = ".chat-history, .feed-compose"
-SELECTOR_MENSAJE = ".chat-message, .feed-note"
+SELECTOR_HISTORIAL = '.chat-history, [class*="chat-history"]'
+SELECTOR_MENSAJE = ", ".join(
+    (
+        ".chat-message",
+        ".feed-note",
+        '[class*="chat-message"]',
+        '[class*="message-item"]',
+        '[data-entity="message"]',
+    )
+)
 SELECTORES_NOMBRE = (
     ".chat-header__title",
     ".feed-header__name",
@@ -35,6 +44,7 @@ SELECTORES_NOMBRE = (
 ITERACIONES_SCROLL = 15
 PAUSA_SCROLL_MS = 1_500
 PAUSA_ESPERA_MS = 10_000
+MAXIMO_CHATS = 5_000
 
 
 def argumentos() -> argparse.Namespace:
@@ -85,14 +95,57 @@ async def nombre_chat(page: Page, elemento_lista: Locator, indice: int) -> str:
     return texto_fila.splitlines()[0].strip() if texto_fila else f"Chat {indice + 1}"
 
 
-async def cargar_historial(historial: Locator) -> None:
-    """Fuerza repetidamente el scroll superior para cargar mensajes antiguos."""
+async def cargar_historial(page: Page, historial: Optional[Locator] = None) -> None:
+    """Carga mensajes antiguos desplazando el contenedor real del historial."""
     for _ in range(ITERACIONES_SCROLL):
-        await historial.evaluate("el => { el.scrollTop = 0; }")
-        await historial.page.wait_for_timeout(PAUSA_SCROLL_MS)
+        if historial is not None:
+            await historial.evaluate("el => { el.scrollTop = 0; }")
+        else:
+            await page.evaluate(
+                """selector => {
+                    const visibles = [...document.querySelectorAll(selector)].filter(el => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                    let el = visibles[0];
+                    while (el) {
+                        if (el.scrollHeight > el.clientHeight + 20) {
+                            el.scrollTop = 0;
+                            return true;
+                        }
+                        el = el.parentElement;
+                    }
+                    return false;
+                }""",
+                SELECTOR_MENSAJE,
+            )
+        await page.wait_for_timeout(PAUSA_SCROLL_MS)
 
 
-def interpretar_fecha(valor: str | None) -> date | None:
+async def desplazar_lista_chats(chat: Locator) -> bool:
+    """Avanza la lista virtual de Kommo y devuelve si aún podía desplazarse."""
+    return await chat.evaluate(
+        """el => {
+            let contenedor = el.parentElement;
+            while (contenedor) {
+                const estilo = getComputedStyle(contenedor);
+                const desplazable = /(auto|scroll)/.test(estilo.overflowY);
+                if (desplazable && contenedor.scrollHeight > contenedor.clientHeight + 20) {
+                    const antes = contenedor.scrollTop;
+                    const maximo = contenedor.scrollHeight - contenedor.clientHeight;
+                    contenedor.scrollTop = Math.min(
+                        maximo, antes + Math.max(200, contenedor.clientHeight * 0.8)
+                    );
+                    return contenedor.scrollTop > antes + 1;
+                }
+                contenedor = contenedor.parentElement;
+            }
+            return false;
+        }"""
+    )
+
+
+def interpretar_fecha(valor: Optional[str]) -> Optional[date]:
     """Convierte fechas ISO o timestamps Unix encontrados en el DOM de Kommo."""
     if not valor:
         return None
@@ -113,7 +166,7 @@ def interpretar_fecha(valor: str | None) -> date | None:
             return None
 
 
-async def fecha_mensaje(mensaje: Locator) -> date | None:
+async def fecha_mensaje(mensaje: Locator) -> Optional[date]:
     """Busca la fecha en los atributos habituales del mensaje o de su ``time``."""
     for atributo in ("data-created-at", "data-timestamp", "data-time", "datetime"):
         encontrada = interpretar_fecha(await mensaje.get_attribute(atributo))
@@ -123,15 +176,27 @@ async def fecha_mensaje(mensaje: Locator) -> date | None:
     tiempos = mensaje.locator("time[datetime]")
     if await tiempos.count():
         return interpretar_fecha(await tiempos.first.get_attribute("datetime"))
+
+    texto = (await mensaje.inner_text()).strip().lower()
+    if re.search(r"\bhoy\b", texto):
+        return date.today()
+    if re.search(r"\bayer\b", texto):
+        return date.fromordinal(date.today().toordinal() - 1)
+    encontrada = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", texto)
+    if encontrada:
+        try:
+            return date(*(int(parte) for parte in encontrada.groups()))
+        except ValueError:
+            pass
     return None
 
 
 async def extraer_mensajes(
-    page: Page, historial: Locator, desde: date
+    page: Page, historial: Optional[Locator], desde: date
 ) -> tuple[list[str], int]:
-    """Extrae solo mensajes fechados desde el límite inclusivo indicado."""
-    mensajes = historial.locator(SELECTOR_MENSAJE)
-    if await mensajes.count() == 0:
+    """Filtra mensajes fechados sin descartar contenido si Kommo oculta la fecha."""
+    mensajes = historial.locator(SELECTOR_MENSAJE) if historial is not None else None
+    if mensajes is None or await mensajes.count() == 0:
         mensajes = page.locator(SELECTOR_MENSAJE)
 
     textos = []
@@ -142,8 +207,7 @@ async def extraer_mensajes(
             fecha = await fecha_mensaje(mensaje)
             if fecha is None:
                 sin_fecha += 1
-                continue
-            if fecha < desde:
+            elif fecha < desde:
                 continue
             texto = (await mensaje.inner_text()).strip()
             if texto:
@@ -191,39 +255,66 @@ async def esperar_inicio_sesion(page: Page) -> None:
 
 
 async def exportar(page: Page, desde: date) -> None:
-    """Recorre ordenadamente las conversaciones actualmente cargadas."""
+    """Recorre también las conversaciones que Kommo carga al hacer scroll."""
     await esperar_inicio_sesion(page)
 
-    chats = await localizar_chats(page)
-    cantidad = await chats.count()
-    if cantidad == 0:
-        raise RuntimeError("La bandeja está visible, pero no contiene chats abiertos.")
-
     ARCHIVO_SALIDA.write_text("", encoding="utf-8")
-    print(f"Se encontraron {cantidad} chats. Exportando mensajes desde {desde}...")
+    print(f"Exportando todos los chats; Kommo cargará más al hacer scroll. Desde {desde}...")
+    procesados: set[str] = set()
+    errores = 0
 
-    for indice in range(cantidad):
-        try:
-            # Se vuelve a crear el locator porque Kommo puede redibujar la lista.
-            chat = (await localizar_chats(page)).nth(indice)
-            await chat.scroll_into_view_if_needed()
-            await chat.click()
-            await page.wait_for_timeout(1_000)
+    while len(procesados) < MAXIMO_CHATS:
+        chats = await localizar_chats(page)
+        ultimo_visible = None
+        for indice in range(await chats.count()):
+            chat = chats.nth(indice)
+            if not await chat.is_visible():
+                continue
+            ultimo_visible = chat
+            texto_fila = (await chat.inner_text()).strip()
+            coincidencia = re.search(r"Lead #\d+", texto_fila)
+            identificador = coincidencia.group(0) if coincidencia else texto_fila
+            if not identificador or identificador in procesados:
+                continue
 
-            historial = await primer_visible(page, SELECTOR_HISTORIAL)
-            nombre = await nombre_chat(page, chat, indice)
-            await cargar_historial(historial)
-            mensajes, sin_fecha = await extraer_mensajes(page, historial, desde)
-            if mensajes:
+            # Se marca antes de hacer clic: un chat defectuoso no bloquea el scroll.
+            procesados.add(identificador)
+            try:
+                await chat.click()
+                await page.wait_for_timeout(1_000)
+                nombre = await nombre_chat(page, chat, len(procesados) - 1)
+                try:
+                    historial = await primer_visible(page, SELECTOR_HISTORIAL)
+                except RuntimeError:
+                    historial = None
+                await cargar_historial(page, historial)
+                mensajes, sin_fecha = await extraer_mensajes(page, historial, desde)
                 guardar_chat(nombre, mensajes)
-                estado = f"Guardado: {nombre} ({len(mensajes)} mensajes)"
-            else:
-                estado = f"Omitido: {nombre} (sin mensajes fechados desde {desde})"
-            if sin_fecha:
-                estado += f"; {sin_fecha} nodos sin fecha se omitieron"
-            print(f"[{indice + 1}/{cantidad}] {estado}")
-        except Exception as error:  # un chat defectuoso no detiene los demás
-            print(f"[{indice + 1}/{cantidad}] Error al procesar el chat: {error}")
+                if mensajes:
+                    estado = f"Guardado: {nombre} ({len(mensajes)} mensajes)"
+                else:
+                    estado = f"Guardado: {nombre} (sin mensajes visibles desde {desde})"
+                if sin_fecha:
+                    estado += f"; {sin_fecha} mensajes sin fecha se conservaron"
+                print(f"[{len(procesados)}] {estado}", flush=True)
+            except Exception as error:  # un chat defectuoso no detiene los demás
+                errores += 1
+                print(f"[{len(procesados)}] Error en {identificador}: {error}", flush=True)
+
+        if ultimo_visible is None:
+            break
+        avanzo = await desplazar_lista_chats(ultimo_visible)
+        print(
+            f"Buscando más conversaciones... {len(procesados)} revisadas.", flush=True
+        )
+        if not avanzo:
+            break
+        await page.wait_for_timeout(PAUSA_SCROLL_MS)
+
+    print(
+        f"Recorrido completo: {len(procesados)} conversaciones, {errores} errores.",
+        flush=True,
+    )
 
 
 async def abrir_bandeja(page: Page) -> None:
