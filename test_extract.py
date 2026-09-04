@@ -76,20 +76,54 @@ class AbrirBandejaTest(unittest.IsolatedAsyncioTestCase):
 
         await extract.abrir_bandeja(Pagina())
 
-    async def test_login_sigue_esperando_despues_del_primer_timeout(self):
-        class Pagina:
-            def __init__(self):
-                self.timeouts = []
+    async def test_detecta_la_bandeja_visible(self):
+        class Chat:
+            async def is_visible(self):
+                return True
 
-            async def wait_for_selector(self, *_args, **opciones):
-                self.timeouts.append(opciones["timeout"])
-                if len(self.timeouts) == 1:
-                    raise extract.PlaywrightTimeoutError("login lento")
+        class Chats:
+            async def count(self):
+                return 1
+
+            def nth(self, _indice):
+                return Chat()
+
+        class Pagina:
+            def locator(self, selector):
+                self.selector = selector
+                return Chats()
 
         pagina = Pagina()
         await extract.esperar_inicio_sesion(pagina)
 
-        self.assertEqual(pagina.timeouts, [120_000, 0])
+        self.assertEqual(pagina.selector, extract.SELECTOR_CHAT)
+
+    async def test_usa_texto_de_lead_si_kommo_cambia_las_clases(self):
+        class Vacio:
+            async def count(self):
+                return 0
+
+        class Pagina:
+            def locator(self, _selector):
+                return Vacio()
+
+            def get_by_text(self, patron):
+                self.patron = patron
+                return "chats por texto"
+
+        pagina = Pagina()
+        resultado = await extract.localizar_chats(pagina)
+
+        self.assertEqual(resultado, "chats por texto")
+        self.assertIsNotNone(pagina.patron.fullmatch("Lead #25166992"))
+
+    async def test_informa_si_se_cierra_el_navegador_durante_la_espera(self):
+        class Pagina:
+            def locator(self, _selector):
+                raise RuntimeError("driver cerrado")
+
+        with self.assertRaisesRegex(RuntimeError, "No cierres la ventana"):
+            await extract.esperar_inicio_sesion(Pagina())
 
 
 if __name__ == "__main__":

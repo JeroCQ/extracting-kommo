@@ -3,6 +3,7 @@
 
 import asyncio
 import argparse
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -13,8 +14,16 @@ from playwright.async_api import async_playwright
 URL_KOMMO = "https://tanakasaludablecali.kommo.com/chats/"
 DIRECTORIO_SESION = Path("./kommo_session")
 ARCHIVO_SALIDA = Path("conversaciones_kommo.txt")
-SELECTOR_LISTA = ".chats-list, .chats-list-item"
-SELECTOR_CHAT = ".chats-list-item"
+SELECTOR_CHAT = ", ".join(
+    (
+        ".chats-list-item",
+        ".chats-list__item",
+        ".inbox-list__item",
+        '[class*="chats-list-item"]',
+        '[class*="inbox-list__item"]',
+        '[data-entity="chat"]',
+    )
+)
 SELECTOR_HISTORIAL = ".chat-history, .feed-compose"
 SELECTOR_MENSAJE = ".chat-message, .feed-note"
 SELECTORES_NOMBRE = (
@@ -25,6 +34,7 @@ SELECTORES_NOMBRE = (
 )
 ITERACIONES_SCROLL = 15
 PAUSA_SCROLL_MS = 1_500
+PAUSA_ESPERA_MS = 10_000
 
 
 def argumentos() -> argparse.Namespace:
@@ -49,6 +59,15 @@ async def primer_visible(page: Page, selector: str) -> Locator:
         if await elemento.is_visible():
             return elemento
     raise RuntimeError(f"No se encontró un elemento visible para: {selector}")
+
+
+async def localizar_chats(page: Page) -> Locator:
+    """Localiza las filas con clases conocidas o por su texto estable ``Lead #``."""
+    candidatos = page.locator(SELECTOR_CHAT)
+    for indice in range(await candidatos.count()):
+        if await candidatos.nth(indice).is_visible():
+            return candidatos
+    return page.get_by_text(re.compile(r"^Lead #\d+$"))
 
 
 async def nombre_chat(page: Page, elemento_lista: Locator, indice: int) -> str:
@@ -146,22 +165,37 @@ def guardar_chat(nombre: str, mensajes: list[str]) -> None:
 
 
 async def esperar_inicio_sesion(page: Page) -> None:
-    """Espera la bandeja sin cerrar el navegador si el login toma más de 120 s."""
-    try:
-        await page.wait_for_selector(SELECTOR_LISTA, state="visible", timeout=120_000)
-    except PlaywrightTimeoutError:
+    """Espera la bandeja e informa periódicamente que el proceso sigue vivo."""
+    transcurrido_ms = 0
+    while True:
+        try:
+            chats = await localizar_chats(page)
+            for indice in range(await chats.count()):
+                if await chats.nth(indice).is_visible():
+                    print("Bandeja detectada; comienza la exportación.", flush=True)
+                    return
+            await page.wait_for_timeout(PAUSA_ESPERA_MS)
+        except Exception as error:
+            raise RuntimeError(
+                "Se perdió la conexión con la ventana de Kommo. No cierres la "
+                "ventana del navegador mientras se ejecuta el programa."
+            ) from error
+
+        transcurrido_ms += PAUSA_ESPERA_MS
+        segundos = transcurrido_ms // 1_000
         print(
-            "Aún no aparece la bandeja. La ventana seguirá abierta: "
-            "termina de iniciar sesión; esperaré sin límite de tiempo..."
+            f"Sigo esperando la bandeja ({segundos} s). "
+            "Puedes completar el inicio de sesión, pero no cierres el navegador.",
+            flush=True,
         )
-        await page.wait_for_selector(SELECTOR_LISTA, state="visible", timeout=0)
 
 
 async def exportar(page: Page, desde: date) -> None:
     """Recorre ordenadamente las conversaciones actualmente cargadas."""
     await esperar_inicio_sesion(page)
 
-    cantidad = await page.locator(SELECTOR_CHAT).count()
+    chats = await localizar_chats(page)
+    cantidad = await chats.count()
     if cantidad == 0:
         raise RuntimeError("La bandeja está visible, pero no contiene chats abiertos.")
 
@@ -171,7 +205,7 @@ async def exportar(page: Page, desde: date) -> None:
     for indice in range(cantidad):
         try:
             # Se vuelve a crear el locator porque Kommo puede redibujar la lista.
-            chat = page.locator(SELECTOR_CHAT).nth(indice)
+            chat = (await localizar_chats(page)).nth(indice)
             await chat.scroll_into_view_if_needed()
             await chat.click()
             await page.wait_for_timeout(1_000)
@@ -214,14 +248,28 @@ async def main(desde: date) -> None:
             headless=False,
             viewport={"width": 1440, "height": 900},
         )
+        error_principal = None
         try:
             pagina = contexto.pages[0] if contexto.pages else await contexto.new_page()
             await abrir_bandeja(pagina)
-            print("Esperando la bandeja. Si es la primera ejecución, inicia sesión manualmente.")
+            print(
+                "Esperando la bandeja. Si es necesario, inicia sesión manualmente. "
+                "Puedes minimizar la ventana, pero no la cierres.",
+                flush=True,
+            )
             await exportar(pagina, desde)
             print(f"Exportación terminada: {ARCHIVO_SALIDA.resolve()}")
+        except Exception as error:
+            error_principal = error
+            raise
         finally:
-            await contexto.close()
+            try:
+                await contexto.close()
+            except Exception as error:
+                # Cerrar la ventana manualmente también corta el driver. No debe
+                # ocultar el error útil que explica qué ocurrió primero.
+                if error_principal is None:
+                    print(f"El navegador ya estaba cerrado: {error}")
 
 
 if __name__ == "__main__":
